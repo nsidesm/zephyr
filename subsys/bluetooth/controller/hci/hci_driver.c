@@ -28,6 +28,10 @@
 #include <drivers/clock_control/nrf_clock_control.h>
 #endif
 
+#if defined(CONFIG_USE_SEGGER_RTT)
+#include <SEGGER_RTT.h>
+#endif
+
 #define BT_DBG_ENABLED IS_ENABLED(CONFIG_BT_DEBUG_HCI_DRIVER)
 #define LOG_MODULE_NAME bt_ctlr_hci_driver
 #include "common/log.h"
@@ -48,6 +52,8 @@
 #include "hci_internal.h"
 
 #include "hal/debug.h"
+
+#include "mitm/mitm.h"
 
 static K_SEM_DEFINE(sem_prio_recv, 0, UINT_MAX);
 static K_FIFO_DEFINE(recv_fifo);
@@ -120,6 +126,8 @@ static void prio_recv_thread(void *p1, void *p2, void *p3)
 #endif
 		}
 
+
+
 		if (node_rx) {
 			uint8_t evt_flags;
 
@@ -148,6 +156,12 @@ static void prio_recv_thread(void *p1, void *p2, void *p3)
 				}
 			}
 
+			/* There may still be completed nodes, continue
+			 * pushing all those up to Host before waiting
+			 * for ULL mayfly
+			 */
+            //le_forward((void *)node_rx->pdu, 3U);
+
 			if (evt_flags & BT_HCI_EVT_FLAG_RECV) {
 				/* Send the rx node up to Host thread,
 				 * recv_thread()
@@ -156,10 +170,6 @@ static void prio_recv_thread(void *p1, void *p2, void *p3)
 				k_fifo_put(&recv_fifo, node_rx);
 			}
 
-			/* There may still be completed nodes, continue
-			 * pushing all those up to Host before waiting
-			 * for ULL mayfly
-			 */
 			continue;
 
 		}

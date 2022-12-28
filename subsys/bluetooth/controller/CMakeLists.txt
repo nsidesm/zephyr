@@ -11,6 +11,8 @@ zephyr_library_sources(
   ll_sw/ll_tx_pwr.c
   hci/hci_driver.c
   hci/hci.c
+  mitm/mitm.c
+  otf_controller_cfg/otf_controller_cfg.c
   )
 
 zephyr_library_sources_ifdef(

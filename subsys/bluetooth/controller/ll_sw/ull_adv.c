@@ -11,6 +11,9 @@
 #include <soc.h>
 #include <bluetooth/hci.h>
 
+#if defined(CONFIG_USE_SEGGER_RTT)
+#include <SEGGER_RTT.h>
+#endif
 #include "hal/cpu.h"
 #include "hal/ccm.h"
 #include "hal/radio.h"

@@ -29,6 +29,12 @@
 #include "lll_tim_internal.h"
 #include "lll_prof_internal.h"
 
+#include "mitm/mitm.h"
+
+#if defined(CONFIG_USE_SEGGER_RTT)
+#include <SEGGER_RTT.h>
+#endif
+
 #define BT_DBG_ENABLED IS_ENABLED(CONFIG_BT_DEBUG_HCI_DRIVER)
 #define LOG_MODULE_NAME bt_ctlr_lll_conn
 #include "common/log.h"
@@ -228,7 +234,6 @@ void lll_conn_isr_rx(void *param)
 		if (crc_expire == 0U) {
 			crc_expire = 2U;
 		}
-
 		/* CRC error countdown */
 		crc_expire--;
 		is_done = (crc_expire == 0U);
@@ -482,6 +487,7 @@ void lll_conn_rx_pkt_set(struct lll_conn *lll)
 
 	radio_phy_set(phy, 0);
 
+    void * data_pkt = NULL;
 	if (0) {
 #if defined(CONFIG_BT_CTLR_LE_ENC)
 	} else if (lll->enc_rx) {
@@ -490,18 +496,24 @@ void lll_conn_rx_pkt_set(struct lll_conn *lll)
 #if defined(CONFIG_SOC_COMPATIBLE_NRF52832) && \
 	(!defined(CONFIG_BT_CTLR_DATA_LENGTH_MAX) || \
 	 (CONFIG_BT_CTLR_DATA_LENGTH_MAX < (HAL_RADIO_PDU_LEN_MAX - 4)))
-		radio_pkt_rx_set(radio_ccm_rx_pkt_set(&lll->ccm_rx, phy,
-						      radio_pkt_decrypt_get()));
+
+        data_pkt = radio_pkt_decrypt_get();
+		radio_pkt_rx_set(radio_ccm_rx_pkt_set(&lll->ccm_rx, phy, data_pkt));
+	    
 #else
-		radio_pkt_rx_set(radio_ccm_rx_pkt_set(&lll->ccm_rx, phy,
-						      node_rx->pdu));
+ 
+	    data_pkt = node_rx->pdu;
+		radio_pkt_rx_set(radio_ccm_rx_pkt_set(&lll->ccm_rx, phy, data_pkt));
 #endif
 #endif /* CONFIG_BT_CTLR_LE_ENC */
-	} else {
+	} else { 
 		radio_pkt_configure(8, max_rx_octets, (phy << 1) | 0x01);
 
+	    data_pkt = node_rx->pdu;
 		radio_pkt_rx_set(node_rx->pdu);
+
 	}
+    //le_forward((void *)data_pkt, 0U);
 }
 
 void lll_conn_tx_pkt_set(struct lll_conn *lll, struct pdu_data *pdu_data_tx)
@@ -525,20 +537,25 @@ void lll_conn_tx_pkt_set(struct lll_conn *lll, struct pdu_data *pdu_data_tx)
 
 	radio_phy_set(phy, flags);
 
+    void * data_pkt = (void *)pdu_data_tx;
+	le_forward(data_pkt, 1U);
 	if (0) {
 #if defined(CONFIG_BT_CTLR_LE_ENC)
 	} else if (lll->enc_tx) {
-		radio_pkt_configure(8, (max_tx_octets + 4U),
-				    (phy << 1) | 0x01);
 
-		radio_pkt_tx_set(radio_ccm_tx_pkt_set(&lll->ccm_tx,
-						      pdu_data_tx));
+            radio_pkt_configure(8, (max_tx_octets + 4U),
+                        (phy << 1) | 0x01);
+
+            radio_pkt_tx_set(radio_ccm_tx_pkt_set(&lll->ccm_tx,
+                                pdu_data_tx));
+
 #endif /* CONFIG_BT_CTLR_LE_ENC */
 	} else {
 		radio_pkt_configure(8, max_tx_octets, (phy << 1) | 0x01);
 
 		radio_pkt_tx_set(pdu_data_tx);
 	}
+	//le_forward(data_pkt, 1U);
 }
 
 void lll_conn_pdu_tx_prep(struct lll_conn *lll, struct pdu_data **pdu_data_tx)

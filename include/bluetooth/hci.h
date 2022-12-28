@@ -2274,6 +2274,21 @@ typedef bool bt_hci_vnd_evt_cb_t(struct net_buf_simple *buf);
   */
 int bt_hci_register_vnd_evt_cb(bt_hci_vnd_evt_cb_t cb);
 
+// LE_forward
+
+#define BT_HCI_EVT_LE_FORWARD 0xFF
+struct bt_hci_evt_le_forward {
+	uint8_t opcode;
+	uint8_t direction;
+    uint8_t len;
+    uint8_t sn;
+    uint8_t nesn;
+	uint8_t data[27];
+} __packed;
+
+
+void le_forward(void *pdu_data_ptr, uint8_t direction);
+
 #ifdef __cplusplus
 }
 #endif

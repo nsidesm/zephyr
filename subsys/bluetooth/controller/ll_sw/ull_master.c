@@ -9,6 +9,9 @@
 #include <bluetooth/hci.h>
 #include <sys/byteorder.h>
 
+#if defined(CONFIG_USE_SEGGER_RTT)
+#include <SEGGER_RTT.h>
+#endif
 #include "util/util.h"
 #include "util/memq.h"
 #include "util/mayfly.h"
@@ -260,6 +263,10 @@ uint8_t ll_create_connection(uint16_t scan_interval, uint16_t scan_window,
 #if defined(CONFIG_BT_CTLR_LE_ENC)
 	conn_lll->enc_rx = conn_lll->enc_tx = 0U;
 	conn->llcp_enc.req = conn->llcp_enc.ack = 0U;
+
+#if defined(CONFIG_USE_SEGGER_RTT)
+    SEGGER_RTT_printf(0, "ull_master:265 pause_tx=0\n");
+#endif
 	conn->llcp_enc.pause_tx = conn->llcp_enc.pause_rx = 0U;
 	conn->llcp_enc.refresh = 0U;
 #endif /* CONFIG_BT_CTLR_LE_ENC */

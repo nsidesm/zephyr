@@ -22,6 +22,10 @@
 #include <sys/byteorder.h>
 #include <sys/util.h>
 
+#if defined(CONFIG_USE_SEGGER_RTT)
+#include <SEGGER_RTT.h>
+#endif
+
 #include "util/util.h"
 #include "util/memq.h"
 #include "hal/ecb.h"
@@ -39,6 +43,9 @@
 #include "ll_settings.h"
 #include "hci_internal.h"
 #include "hci_vendor.h"
+
+#include "otf_controller_cfg/otf_controller_cfg.h"
+#include "mitm/mitm.h"
 
 #if defined(CONFIG_BT_HCI_MESH_EXT)
 #include "ll_sw/ll_mesh.h"
@@ -300,6 +307,7 @@ static void reset(struct net_buf *buf, struct net_buf **evt)
 
 	/* reset event masks */
 	event_mask = DEFAULT_EVENT_MASK;
+
 	event_mask_page_2 = DEFAULT_EVENT_MASK_PAGE_2;
 	le_event_mask = DEFAULT_LE_EVENT_MASK;
 
@@ -326,6 +334,7 @@ static void reset(struct net_buf *buf, struct net_buf **evt)
 		k_poll_signal_raise(hbuf_signal, 0x0);
 	}
 #endif
+
 }
 
 #if defined(CONFIG_BT_HCI_ACL_FLOW_CONTROL)
@@ -369,6 +378,8 @@ static void set_ctl_to_host_flow(struct net_buf *buf, struct net_buf **evt)
 	hci_hbuf_acked = 0U;
 	(void)memset(hci_hbuf_pend, 0, sizeof(hci_hbuf_pend));
 	hci_hbuf_total = -hci_hbuf_total;
+
+
 }
 
 static void host_buffer_size(struct net_buf *buf, struct net_buf **evt)
@@ -1084,6 +1095,9 @@ static void le_set_adv_enable(struct net_buf *buf, struct net_buf **evt)
 	status = ll_adv_enable(cmd->enable);
 #endif /* !CONFIG_BT_CTLR_ADV_EXT || !CONFIG_BT_HCI_MESH_EXT */
 
+#if defined(CONFIG_USE_SEGGER_RTT)
+	    SEGGER_RTT_printf(0, "Advertising %d changed: %d", status==0U?"sucessful":"not", cmd->enable);
+#endif
 	*evt = cmd_complete_status(status);
 }
 
@@ -2916,6 +2930,477 @@ uint8_t bt_read_static_addr(struct bt_hci_vs_static_addr addrs[], uint8_t size)
 }
 #endif /* !defined(CONFIG_BT_HCI_VS_EXT) */
 
+/**
+ * Function to enable the MITM setup 
+ */
+static void vs_set_mitm_flag(struct net_buf *buf, struct net_buf **evt)
+{
+	struct bt_hci_cp_vs_set_mitm_flag *cmd = (void *)buf->data;
+    
+	MITM_ON = cmd->mitm_flag;
+    MITM_ENC_ON = 0U;
+
+	*evt = cmd_complete_status(0x00);
+}
+
+/**
+ * Function to send arbitrary CTRL PDUs
+ */
+static void vs_send_ctrl_pdu(struct net_buf *buf, struct net_buf **evt)
+{
+/*
+struct bt_hci_cp_vs_send_ctrl_pdu {
+	uint8_t opcode;
+    uint8_t len;
+	uint8_t data[27];
+} __packed;
+    */
+    
+	struct bt_hci_cp_vs_send_ctrl_pdu *cmd = (void *)buf->data;
+	uint8_t ret = 0;
+
+    uint8_t opcode = cmd->opcode;
+
+    if(MITM_ENC_ON){
+        opcode = 0xFF;
+    }
+
+    if(opcode!=0xFF)
+    {
+        ret = mitm_ctrl_pdu_send(cmd->opcode, cmd->len, &cmd->data[0]);
+        if(opcode==PDU_DATA_LLCTRL_TYPE_START_ENC_REQ && MITM_ON){
+            MITM_ENC_ON = 1U;
+        }
+    }
+    else
+    {
+        ret = mitm_ctrl_pdu_send(cmd->opcode, cmd->len, &cmd->data[0]);
+    }
+	*evt = cmd_complete_status(ret);
+    return;
+}
+/**
+ * Function to register the PDUs which should be blocked 
+ */
+static void vs_set_blocked_ctrl_pdu(struct net_buf *buf, struct net_buf **evt)
+{
+	struct bt_hci_cp_vs_set_blocked_ctrl_pdu *cmd = (void *)buf->data;
+    
+    set_blocked_ctrl_pdu((void*)cmd);
+
+	*evt = cmd_complete_status(0x00);
+
+}
+/*
+#define BT_HCI_EVT_LE_FORWARD 0xFF
+struct bt_hci_evt_le_forward {
+	uint8_t opcode;
+	uint8_t direction;
+    uint8_t len;
+    uint8_t sn;
+    uint8_t nesn;
+	uint8_t data[27];
+} __packed;
+*/
+
+void le_forward(void *pdu_data_ptr, uint8_t direction)
+{
+    struct pdu_data *pdu_data =  (void *)pdu_data_ptr;
+    struct bt_hci_evt_le_forward *ep;
+	struct net_buf *buf = NULL;
+    // direction = 1U => transmitted PDU
+    // direction = 2U => received Ctrl PDU
+    if(pdu_data->ll_id!=PDU_DATA_LLID_CTRL && direction!=0U)
+    {
+        return;
+    }
+    if(pdu_data->len==0U)
+    {
+        return;
+    }
+	buf = bt_buf_get_rx(BT_BUF_EVT, K_FOREVER);
+
+	if (!buf) {
+#if defined(CONFIG_USE_SEGGER_RTT)
+	    SEGGER_RTT_printf(0, "No buffer for %s PDU: %20x\n", direction==1U ? "transmitted" : "received", pdu_data->llctrl.opcode );
+#endif
+		return;
+	}
+	hci_evt_create(buf, BT_HCI_EVT_LE_FORWARD, sizeof(*ep));
+
+	ep = net_buf_add(buf, sizeof(*ep));
+
+    if(MITM_ENC_ON){
+        ep->opcode = 0xFF;
+    }
+    else
+    {
+        ep->opcode = pdu_data->llctrl.opcode;
+    }
+	ep->direction = direction;
+    ep->sn = pdu_data->sn;
+    ep->nesn = pdu_data->nesn;
+    ep->len = pdu_data->len;
+    //ep->size = size;
+	memset(&ep->data, 0, sizeof(ep->data));
+	uint8_t opcode = ep->opcode;
+	switch (opcode) {
+	case PDU_DATA_LLCTRL_TYPE_CONN_UPDATE_IND:
+		/*
+	        struct pdu_data_llctrl_conn_update_ind {
+	            uint8_t  win_size;
+	            uint16_t win_offset;
+	            uint16_t interval;
+	            uint16_t latency;
+	            uint16_t timeout;
+	            uint16_t instant;
+	        } __packed;
+	        */
+		memcpy(&ep->data, &pdu_data->llctrl.conn_update_ind.win_size,
+		       1);
+		memcpy(&ep->data[1],
+		       &pdu_data->llctrl.conn_update_ind.win_offset, 2);
+		memcpy(&ep->data[3], &pdu_data->llctrl.conn_update_ind.interval,
+		       2);
+		memcpy(&ep->data[5], &pdu_data->llctrl.conn_update_ind.latency,
+		       2);
+		memcpy(&ep->data[7], &pdu_data->llctrl.conn_update_ind.timeout,
+		       2);
+		memcpy(&ep->data[9], &pdu_data->llctrl.conn_update_ind.instant,
+		       2);
+		break;
+	case PDU_DATA_LLCTRL_TYPE_CHAN_MAP_IND:
+		/*
+	        struct pdu_data_llctrl_chan_map_ind {
+	            uint8_t  chm[5];
+	            uint16_t instant;
+	        } __packed;
+	        */
+		memcpy(&ep->data, &pdu_data->llctrl.chan_map_ind.chm, 5);
+		memcpy(&ep->data[5], &pdu_data->llctrl.chan_map_ind.instant, 2);
+		break;
+	case PDU_DATA_LLCTRL_TYPE_TERMINATE_IND:
+		/*
+	        struct pdu_data_llctrl_terminate_ind {
+	            uint8_t error_code;
+	        } __packed;
+	        */
+		memcpy(&ep->data, &pdu_data->llctrl.terminate_ind.error_code,
+		       1);
+		break;
+
+	case PDU_DATA_LLCTRL_TYPE_FEATURE_REQ:
+		/*
+	        struct pdu_data_llctrl_feature_req {
+	            uint8_t features[8];
+	        } __packed;
+	        */
+		memcpy(&ep->data, &pdu_data->llctrl.feature_req.features, 8);
+		break;
+	case PDU_DATA_LLCTRL_TYPE_FEATURE_RSP:
+		/*
+	        struct pdu_data_llctrl_feature_rsp {
+	            uint8_t features[8];
+	        } __packed;;
+	        */
+		memcpy(&ep->data, &pdu_data->llctrl.feature_rsp.features, 8);
+		break;
+#if defined(CONFIG_BT_CTLR_SLAVE_FEAT_REQ)
+	case PDU_DATA_LLCTRL_TYPE_SLAVE_FEATURE_REQ:
+		/*
+	        struct pdu_data_llctrl_slave_feature_req {
+	            uint8_t features[8];
+	        } __packed;
+	        */
+		memcpy(&ep->data, &pdu_data->llctrl.slave_feature_req.features,
+		       8);
+		break;
+#endif /* PDU_DATA_LLCTRL_TYPE_SLAVE_FEATURE_REQ */
+#if defined(CONFIG_BT_CTLR_LE_PING)
+	case PDU_DATA_LLCTRL_TYPE_PING_REQ:
+	case PDU_DATA_LLCTRL_TYPE_PING_RSP:
+		/*
+	        Empty nothing to do
+	        */
+		break;
+#endif /*CONFIG_BT_CTLR_LE_PING*/
+	case PDU_DATA_LLCTRL_TYPE_PHY_REQ:
+		/*
+	        struct pdu_data_llctrl_phy_req {
+	            uint8_t tx_phys;
+	            uint8_t rx_phys;
+	        } __packed;
+	        */
+		memcpy(&ep->data, &pdu_data->llctrl.phy_req.tx_phys, 1);
+		memcpy(&ep->data[1], &pdu_data->llctrl.phy_req.rx_phys, 1);
+	case PDU_DATA_LLCTRL_TYPE_PHY_RSP:
+		/*
+	        struct pdu_data_llctrl_phy_rsp {
+	            uint8_t tx_phys;
+	            uint8_t rx_phys;
+	        } __packed;
+	        */
+		memcpy(&ep->data, &pdu_data->llctrl.phy_rsp.tx_phys, 1);
+		memcpy(&ep->data[1], &pdu_data->llctrl.phy_rsp.rx_phys, 1);
+		break;
+	case PDU_DATA_LLCTRL_TYPE_PHY_UPD_IND:
+		/*
+	    struct pdu_data_llctrl_phy_upd_ind {
+	        uint8_t  m_to_s_phy;
+	        uint8_t  s_to_m_phy;
+	        uint16_t instant;
+	    } __packed;
+	    */
+		memcpy(&ep->data, &pdu_data->llctrl.phy_upd_ind.m_to_s_phy, 1);
+		memcpy(&ep->data[1], &pdu_data->llctrl.phy_upd_ind.s_to_m_phy,
+		       1);
+		memcpy(&ep->data[2], &pdu_data->llctrl.phy_upd_ind.instant, 2);
+		break;
+#if defined(CONFIG_BT_CTLR_MIN_USED_CHAN)
+	case PDU_DATA_LLCTRL_TYPE_MIN_USED_CHAN_IND:
+		/*
+	    struct pdu_data_llctrl_min_used_chans_ind {
+	        uint8_t phys;
+	        uint8_t min_used_chans;
+	    } __packed;
+	    */
+		memcpy(&ep->data, &pdu_data->llctrl.min_used_chans_ind.phys, 1);
+		memcpy(&ep->data[1],
+		       &pdu_data->llctrl.min_used_chans_ind.min_used_chans, 1);
+		break;
+#endif /* CONFIG_BT_CTLR_MIN_USED_CHAN */
+
+#if defined(CONFIG_BT_CTLR_LE_ENC)
+	case PDU_DATA_LLCTRL_TYPE_ENC_REQ:
+		/*
+	        struct pdu_data_llctrl_enc_req {
+	            uint8_t rand[8];
+	            uint8_t ediv[2];
+	            uint8_t skdm[8];
+	            uint8_t ivm[4];
+	        } __packed;
+	        */
+		memcpy(&ep->data, &pdu_data->llctrl.enc_req.rand, 8);
+		memcpy(&ep->data[8], &pdu_data->llctrl.enc_req.ediv, 2);
+		memcpy(&ep->data[10], &pdu_data->llctrl.enc_req.skdm, 8);
+		memcpy(&ep->data[18], &pdu_data->llctrl.enc_req.ivm, 4);
+
+		break;
+	case PDU_DATA_LLCTRL_TYPE_ENC_RSP:
+		/*
+	        struct pdu_data_llctrl_enc_rsp {
+	            uint8_t skds[8];
+	            uint8_t ivs[4];
+	        } __packed;
+	        */
+		memcpy(&ep->data, &pdu_data->llctrl.enc_rsp.skds, 8);
+		memcpy(&ep->data[8], &pdu_data->llctrl.enc_rsp.ivs, 4);
+		break;
+
+	case PDU_DATA_LLCTRL_TYPE_REJECT_EXT_IND:
+		/*
+	        struct pdu_data_llctrl_reject_ext_ind {
+	            uint8_t reject_opcode;
+	            uint8_t error_code;
+	        } __packed;
+	        */
+		memcpy(&ep->data,
+		       &pdu_data->llctrl.reject_ext_ind.reject_opcode, 1);
+		memcpy(&ep->data[1],
+		       &pdu_data->llctrl.reject_ext_ind.error_code, 1);
+		break;
+
+	case PDU_DATA_LLCTRL_TYPE_REJECT_IND:
+		/*
+	        struct pdu_data_llctrl_reject_ind {
+	            uint8_t error_code;
+	        } __packed;
+	        */
+		memcpy(&ep->data, &pdu_data->llctrl.reject_ind.error_code, 1);
+		break;
+#endif /* CONFIG_BT_CTLR_LE_ENC */
+
+#if defined(CONFIG_BT_REMOTE_VERSION)
+	case PDU_DATA_LLCTRL_TYPE_VERSION_IND:
+		/*
+	        struct pdu_data_llctrl_version_ind {
+	            uint8_t  version_number;
+	            uint16_t company_id;
+	            uint16_t sub_version_number;
+	        } __packed;
+	        */
+		memcpy(&ep->data, &pdu_data->llctrl.version_ind.version_number,
+		       1);
+		memcpy(&ep->data[1], &pdu_data->llctrl.version_ind.company_id,
+		       2);
+		memcpy(&ep->data[3],
+		       &pdu_data->llctrl.version_ind.sub_version_number, 2);
+		break;
+#endif /* defined(CONFIG_BT_REMOTE_VERSION) */
+
+#if defined(CONFIG_BT_CTLR_CONN_PARAM_REQ)
+	case PDU_DATA_LLCTRL_TYPE_CONN_PARAM_REQ:
+		/*
+	        struct pdu_data_llctrl_conn_param_req {
+	            uint16_t interval_min;
+	            uint16_t interval_max;
+	            uint16_t latency;
+	            uint16_t timeout;
+	            uint8_t  preferred_periodicity;
+	            uint16_t reference_conn_event_count;
+	            uint16_t offset0;
+	            uint16_t offset1;
+	            uint16_t offset2;
+	            uint16_t offset3;
+	            uint16_t offset4;
+	            uint16_t offset5;
+	        } __packed;
+	        */
+		memcpy(&ep->data, &pdu_data->llctrl.conn_param_req.interval_min,
+		       2);
+		memcpy(&ep->data[2],
+		       &pdu_data->llctrl.conn_param_req.interval_max, 2);
+		memcpy(&ep->data[4], &pdu_data->llctrl.conn_param_req.latency,
+		       2);
+		memcpy(&ep->data[6], &pdu_data->llctrl.conn_param_req.timeout,
+		       2);
+		memcpy(&ep->data[8],
+		       &pdu_data->llctrl.conn_param_req.preferred_periodicity,
+		       1);
+		memcpy(&ep->data[9],
+		       &pdu_data->llctrl.conn_param_req
+				.reference_conn_event_count,
+		       2);
+		memcpy(&ep->data[11], &pdu_data->llctrl.conn_param_req.offset0,
+		       2);
+		memcpy(&ep->data[13], &pdu_data->llctrl.conn_param_req.offset1,
+		       2);
+		memcpy(&ep->data[15], &pdu_data->llctrl.conn_param_req.offset2,
+		       2);
+		memcpy(&ep->data[17], &pdu_data->llctrl.conn_param_req.offset3,
+		       2);
+		memcpy(&ep->data[19], &pdu_data->llctrl.conn_param_req.offset4,
+		       2);
+		memcpy(&ep->data[21], &pdu_data->llctrl.conn_param_req.offset5,
+		       2);
+		break;
+	case PDU_DATA_LLCTRL_TYPE_CONN_PARAM_RSP:
+		/*
+	        struct pdu_data_llctrl_conn_param_rsp {
+	            uint16_t interval_min;
+	            uint16_t interval_max;
+	            uint16_t latency;
+	            uint16_t timeout;
+	            uint8_t  preferred_periodicity;
+	            uint16_t reference_conn_event_count;
+	            uint16_t offset0;
+	            uint16_t offset1;
+	            uint16_t offset2;
+	            uint16_t offset3;
+	            uint16_t offset4;
+	            uint16_t offset5;
+	        } __packed;
+	        */
+		memcpy(&ep->data, &pdu_data->llctrl.conn_param_rsp.interval_min,
+		       2);
+		memcpy(&ep->data[2],
+		       &pdu_data->llctrl.conn_param_rsp.interval_max, 2);
+		memcpy(&ep->data[4], &pdu_data->llctrl.conn_param_rsp.latency,
+		       2);
+		memcpy(&ep->data[6], &pdu_data->llctrl.conn_param_rsp.timeout,
+		       2);
+		memcpy(&ep->data[8],
+		       &pdu_data->llctrl.conn_param_rsp.preferred_periodicity,
+		       1);
+		memcpy(&ep->data[9],
+		       &pdu_data->llctrl.conn_param_rsp
+				.reference_conn_event_count,
+		       2);
+		memcpy(&ep->data[11], &pdu_data->llctrl.conn_param_rsp.offset0,
+		       2);
+		memcpy(&ep->data[13], &pdu_data->llctrl.conn_param_rsp.offset1,
+		       2);
+		memcpy(&ep->data[15], &pdu_data->llctrl.conn_param_rsp.offset2,
+		       2);
+		memcpy(&ep->data[17], &pdu_data->llctrl.conn_param_rsp.offset3,
+		       2);
+		memcpy(&ep->data[19], &pdu_data->llctrl.conn_param_rsp.offset4,
+		       2);
+		memcpy(&ep->data[21], &pdu_data->llctrl.conn_param_rsp.offset5,
+		       2);
+		break;
+#endif /* CONFIG_BT_CTLR_CONN_PARAM_REQ */
+
+#if defined(CONFIG_BT_CTLR_DATA_LENGTH)
+	case PDU_DATA_LLCTRL_TYPE_LENGTH_REQ:
+		/*
+	        struct pdu_data_llctrl_length_req {
+	            uint16_t max_rx_octets;
+	            uint16_t max_rx_time;
+	            uint16_t max_tx_octets;
+	            uint16_t max_tx_time;
+	        } __packed;
+	        */
+		memcpy(&ep->data, &pdu_data->llctrl.length_req.max_rx_octets,
+		       2);
+		memcpy(&ep->data[2], &pdu_data->llctrl.length_req.max_rx_time,
+		       2);
+		memcpy(&ep->data[4], &pdu_data->llctrl.length_req.max_tx_octets,
+		       2);
+		memcpy(&ep->data[6], &pdu_data->llctrl.length_req.max_tx_time,
+		       2);
+		break;
+	case PDU_DATA_LLCTRL_TYPE_LENGTH_RSP:
+		/*
+	        struct pdu_data_llctrl_length_rsp {
+	            uint16_t max_rx_octets;
+	            uint16_t max_rx_time;
+	            uint16_t max_tx_octets;
+	            uint16_t max_tx_time;
+	        } __packed;
+	        */
+		memcpy(&ep->data, &pdu_data->llctrl.length_rsp.max_rx_octets,
+		       2);
+		memcpy(&ep->data[2], &pdu_data->llctrl.length_rsp.max_rx_time,
+		       2);
+		memcpy(&ep->data[4], &pdu_data->llctrl.length_rsp.max_tx_octets,
+		       2);
+		memcpy(&ep->data[6], &pdu_data->llctrl.length_rsp.max_tx_time,
+		       2);
+		break;
+#endif /* CONFIG_BT_CTLR_DATA_LENGTH */
+
+	case PDU_DATA_LLCTRL_TYPE_UNKNOWN_RSP:
+		/*
+	        struct pdu_data_llctrl_unknown_rsp {
+	            uint8_t type;
+	        } __packed;
+	        */
+		memcpy(&ep->data, &pdu_data->llctrl.unknown_rsp.type, 1);
+		break;
+	case PDU_DATA_LLCTRL_TYPE_START_ENC_RSP:
+	case PDU_DATA_LLCTRL_TYPE_START_ENC_REQ:
+	case PDU_DATA_LLCTRL_TYPE_PAUSE_ENC_REQ:
+	case PDU_DATA_LLCTRL_TYPE_PAUSE_ENC_RSP:
+		/*
+                Empty nothing to do
+                */
+		break;
+        default:
+		memcpy(&ep->data, &pdu_data->lldata, pdu_data->len);
+
+        break;
+	}
+	if (buf) {
+		if (buf->len) {
+			BT_DBG("Packet in: type:%u len:%u",
+			       bt_buf_get_type(buf), buf->len);
+			bt_recv(buf);
+		} else {
+			net_buf_unref(buf);
+		}
+	}
+}
 #if defined(CONFIG_BT_HCI_VS_EXT)
 static void vs_write_bd_addr(struct net_buf *buf, struct net_buf **evt)
 {
@@ -3196,6 +3681,18 @@ int hci_vendor_cmd_handle_common(uint16_t ocf, struct net_buf *cmd,
 		break;
 #endif /* CONFIG_USB_DEVICE_BLUETOOTH_VS_H4 */
 
+	case BT_OCF(BT_HCI_OP_VS_SET_MITM_FLAG):
+		vs_set_mitm_flag(cmd, evt);
+		break;
+
+	case BT_OCF(BT_HCI_VS_SEND_CTRL_PDU):
+		vs_send_ctrl_pdu(cmd, evt);
+		break;
+
+    case BT_OCF(BT_HCI_VS_SET_BLOCKED_CTRL_PDU):
+        vs_set_blocked_ctrl_pdu(cmd, evt);
+		break;
+
 #if defined(CONFIG_BT_HCI_VS_EXT)
 	case BT_OCF(BT_HCI_OP_VS_READ_BUILD_INFO):
 		vs_read_build_info(cmd, evt);
@@ -3374,7 +3871,6 @@ int hci_acl_handle(struct net_buf *buf, struct net_buf **evt)
 		ll_tx_mem_release(node_tx);
 		return -EINVAL;
 	}
-
 	return 0;
 }
 #endif /* CONFIG_BT_CONN */
@@ -4295,7 +4791,6 @@ static void le_conn_complete(struct pdu_data *pdu_data, uint16_t handle,
 			       &cc->peer_rpa[0]);
 	}
 #endif
-
 	if (!(event_mask & BT_EVT_MASK_LE_META_EVENT) ||
 	    (!(le_event_mask & BT_EVT_MASK_LE_CONN_COMPLETE) &&
 #if defined(CONFIG_BT_CTLR_PRIVACY) || defined(CONFIG_BT_CTLR_ADV_EXT)
@@ -4899,6 +5394,8 @@ void hci_acl_encode(struct node_rx_pdu *node_rx, struct net_buf *buf)
 	switch (pdu_data->ll_id) {
 	case PDU_DATA_LLID_DATA_CONTINUE:
 	case PDU_DATA_LLID_DATA_START:
+
+
 		acl = (void *)net_buf_add(buf, sizeof(*acl));
 		if (pdu_data->ll_id == PDU_DATA_LLID_DATA_START) {
 			handle_flags = bt_acl_handle_pack(handle, BT_ACL_START);
